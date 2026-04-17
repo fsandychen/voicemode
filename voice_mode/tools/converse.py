@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import threading
 import time
 import traceback
 from typing import Optional, Literal, Tuple, Dict, Union
@@ -100,6 +101,36 @@ logger.info(f"Module loaded with DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETE
 
 # Windows 平台偵測
 _IS_WINDOWS = os.name == 'nt'
+
+
+def _sd_wait_with_timeout(timeout_s: float = 5.0) -> bool:
+    """sd.wait() 的超時版本，防止在 Windows 上無限阻塞。
+
+    用 daemon thread 執行 sd.wait()，主線程透過 Event.wait(timeout) 等待。
+    若超時則呼叫 sd.stop() 強制結束錄音，避免 MCP 工具呼叫永遠掛起。
+    """
+    done = threading.Event()
+
+    def _wait():
+        try:
+            sd.wait()
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_wait, daemon=True)
+    t.start()
+
+    if not done.wait(timeout=timeout_s):
+        # 超時，強制停止錄音
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        logger.warning(f"sd.wait() timed out after {timeout_s:.1f}s, forced stop")
+        return False
+    return True
 
 
 def is_tmux() -> bool:
@@ -806,7 +837,10 @@ def record_audio(duration: float) -> np.ndarray:
             channels=CHANNELS,
             dtype=np.int16
         )
-        sd.wait()
+        wait_ok = _sd_wait_with_timeout(duration + 5.0)
+        if not wait_ok:
+            logger.error(f"Recording timed out after {duration + 5.0}s")
+            return np.array([], dtype=np.int16)
         
         flattened = recording.flatten()
         logger.info(f"✓ Recorded {len(flattened)} samples")
@@ -1011,7 +1045,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         channels=CHANNELS,
                         dtype=np.int16
                     )
-                    sd.wait()
+                    wait_ok = _sd_wait_with_timeout(2.0)
+                    if not wait_ok:
+                        logger.warning("Chunk recording timed out, stopping early")
+                        break
 
                     chunk_flat = chunk_recording.flatten()
                     chunks.append(chunk_flat)
@@ -1686,9 +1723,17 @@ consult the MCP resources listed above.
 
                 record_start = time.perf_counter()
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}")
-                audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
-                )
+                _record_timeout = listen_duration_max + 15.0
+                try:
+                    audio_data, speech_detected = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                        ),
+                        timeout=_record_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"Recording timed out after {_record_timeout:.0f}s (max_duration={listen_duration_max}s)")
+                    audio_data, speech_detected = np.array([]), False
                 timings['record'] = time.perf_counter() - record_start
                 
                 # Log recording end
@@ -1866,9 +1911,17 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
-                        )
+                        _record_timeout = listen_duration_max + 15.0
+                        try:
+                            audio_data, speech_detected = await asyncio.wait_for(
+                                asyncio.get_event_loop().run_in_executor(
+                                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                                ),
+                                timeout=_record_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"Recording timed out after {_record_timeout:.0f}s (repeat re-record)")
+                            audio_data, speech_detected = np.array([]), False
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
 
@@ -1922,9 +1975,17 @@ consult the MCP resources listed above.
 
                         # Record audio
                         record_start = time.perf_counter()
-                        audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
-                        )
+                        _record_timeout = listen_duration_max + 15.0
+                        try:
+                            audio_data, speech_detected = await asyncio.wait_for(
+                                asyncio.get_event_loop().run_in_executor(
+                                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                                ),
+                                timeout=_record_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"Recording timed out after {_record_timeout:.0f}s (wait re-record)")
+                            audio_data, speech_detected = np.array([]), False
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
 
