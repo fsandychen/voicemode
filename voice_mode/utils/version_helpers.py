@@ -17,6 +17,8 @@ def get_git_tags(repo_url: str) -> List[str]:
             ["git", "ls-remote", "--tags", repo_url],
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=True
         )
         
@@ -109,6 +111,8 @@ def get_current_version(install_dir: Path) -> Optional[str]:
             cwd=install_dir,
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=True
         )
         version = result.stdout.strip()
@@ -119,7 +123,9 @@ def get_current_version(install_dir: Path) -> Optional[str]:
                 ["git", "describe", "--tags", "--exact-match"],
                 cwd=install_dir,
                 capture_output=True,
-                text=True
+                text=True,
+                encoding='utf-8',
+                errors='replace'
             )
             if result.returncode == 0:
                 version = result.stdout.strip()
@@ -133,6 +139,8 @@ def get_current_version(install_dir: Path) -> Optional[str]:
                 cwd=install_dir,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 check=True
             )
             return result.stdout.strip()

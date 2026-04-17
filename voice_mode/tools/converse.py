@@ -98,6 +98,9 @@ logger = logging.getLogger("voicemode")
 # Log silence detection config at module load time
 logger.info(f"Module loaded with DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}")
 
+# Windows 平台偵測
+_IS_WINDOWS = os.name == 'nt'
+
 
 def is_tmux() -> bool:
     """Check if the current process is running inside a tmux session."""
@@ -906,13 +909,22 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
     """
     
     logger.info(f"record_audio_with_silence_detection called - VAD_AVAILABLE={VAD_AVAILABLE}, DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}, min_duration={min_duration}")
-    
+
     if not VAD_AVAILABLE:
         logger.warning("webrtcvad not available, falling back to fixed duration recording")
         # For fallback, assume speech is present since we can't detect
         return (record_audio(max_duration), True)
-    
-    if DISABLE_SILENCE_DETECTION or disable_silence_detection:
+
+    # Windows: 即使全域 DISABLE_SILENCE_DETECTION=true 仍強制啟用 VAD
+    # 因為 Windows 使用 sd.rec() 輪詢模式，不需要 InputStream callback
+    if _IS_WINDOWS:
+        effective_disable = disable_silence_detection
+        if DISABLE_SILENCE_DETECTION and not disable_silence_detection:
+            logger.info("Windows: overriding global DISABLE_SILENCE_DETECTION, using polling-based VAD")
+    else:
+        effective_disable = DISABLE_SILENCE_DETECTION or disable_silence_detection
+
+    if effective_disable:
         if disable_silence_detection:
             logger.info("Silence detection disabled for this interaction by request")
         else:
@@ -983,8 +995,75 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     return
             # Put the audio data in the queue for processing
             audio_queue.put(indata.copy())
-        
+
         try:
+            if _IS_WINDOWS:
+                # Windows: sd.InputStream callback 在 MCP 進程中不會觸發
+                # 改用 sd.rec() + sd.wait() 分段輪詢錄音
+                logger.info("Windows: using polling-based VAD recording (sd.rec + sd.wait)")
+
+                while recording_duration < max_duration and not stop_recording:
+                    # 每段錄一個 chunk 的長度
+                    chunk_num_samples = int(chunk_samples)
+                    chunk_recording = sd.rec(
+                        chunk_num_samples,
+                        samplerate=SAMPLE_RATE,
+                        channels=CHANNELS,
+                        dtype=np.int16
+                    )
+                    sd.wait()
+
+                    chunk_flat = chunk_recording.flatten()
+                    chunks.append(chunk_flat)
+
+                    # 降取樣 24kHz → 16kHz 給 VAD
+                    from scipy import signal
+                    resampled_length = int(len(chunk_flat) * vad_sample_rate / SAMPLE_RATE)
+                    vad_chunk = signal.resample(chunk_flat, resampled_length)
+                    vad_chunk = vad_chunk[:vad_chunk_samples].astype(np.int16)
+                    chunk_bytes = vad_chunk.tobytes()
+
+                    # VAD 判斷
+                    try:
+                        is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
+                    except Exception as vad_e:
+                        logger.warning(f"VAD error: {vad_e}, treating as speech")
+                        is_speech = True
+
+                    # 狀態機：等待語音 → 偵測語音 → 累積靜音 → 超過閾值停止
+                    if not speech_detected:
+                        if is_speech:
+                            logger.info("🎤 Speech detected, starting active recording")
+                            speech_detected = True
+                            silence_duration_ms = 0
+                    else:
+                        if is_speech:
+                            silence_duration_ms = 0
+                        else:
+                            silence_duration_ms += VAD_CHUNK_DURATION_MS
+                            if silence_duration_ms % 200 == 0:
+                                logger.debug(f"Silence: {silence_duration_ms}ms")
+
+                            effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
+                            if recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
+                                stop_recording = True
+
+                    recording_duration += chunk_duration_s
+
+                # Windows 輪詢結束，組合結果並提前返回
+                if chunks:
+                    full_recording = np.concatenate(chunks)
+                    if not speech_detected:
+                        logger.info(f"✓ Recording completed ({recording_duration:.1f}s) - No speech detected")
+                    else:
+                        logger.info(f"✓ Recorded {len(full_recording)} samples ({recording_duration:.1f}s) with speech")
+                    return (full_recording, speech_detected)
+                else:
+                    logger.warning("No audio chunks recorded")
+                    return (np.array([]), False)
+
+            # Unix 路徑：使用 InputStream + callback
             # Create continuous input stream
             with sd.InputStream(samplerate=SAMPLE_RATE,
                                channels=CHANNELS,

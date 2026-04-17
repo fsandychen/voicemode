@@ -24,12 +24,20 @@ Usage:
         print("Someone is in a voice conversation")
 """
 
-import fcntl
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# Windows 相容性：msvcrt 替代 fcntl
+_IS_WINDOWS = sys.platform == 'win32'
+if _IS_WINDOWS:
+    import msvcrt
+    import ctypes
+else:
+    import fcntl
 
 # Import config for lock expiry - deferred to avoid circular import
 def _get_lock_expiry() -> float:
@@ -117,7 +125,10 @@ class Conch:
             self._fd = os.open(str(self.LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
 
             # Try to get exclusive lock (non-blocking)
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _IS_WINDOWS:
+                msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
             # Got lock - write our info
             self._acquire_time = datetime.now()
@@ -203,7 +214,10 @@ class Conch:
 
         if self._fd is not None:
             try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                if _IS_WINDOWS:
+                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
                 os.close(self._fd)
             except OSError:
                 pass
@@ -244,8 +258,15 @@ class Conch:
             if pid is None:
                 return False
 
-            # Check if process is alive (signal 0 doesn't actually send a signal)
-            os.kill(pid, 0)
+            # Check if process is alive
+            if _IS_WINDOWS:
+                # Windows: 使用 OpenProcess 檢查進程是否存在
+                handle = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)
+                if not handle:
+                    return False
+                ctypes.windll.kernel32.CloseHandle(handle)
+            else:
+                os.kill(pid, 0)
 
             # Check if lock is stale based on timestamp
             lock_expiry = _get_lock_expiry()

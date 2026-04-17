@@ -10,21 +10,37 @@ from typing import Optional, Tuple
 
 def check_ffmpeg() -> Tuple[bool, Optional[str]]:
     """Check if FFmpeg is installed and accessible.
-    
+
     Returns:
         Tuple of (is_installed, path_to_ffmpeg)
     """
     ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path is None and platform.system() == 'Windows':
+        # Windows: 搜尋 WinGet Packages 目錄下的 ffmpeg
+        winget_base = Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft' / 'WinGet' / 'Packages'
+        if winget_base.exists():
+            for root, dirs, files in os.walk(winget_base):
+                if 'ffmpeg.exe' in files:
+                    ffmpeg_path = str(Path(root) / 'ffmpeg.exe')
+                    break
     return (ffmpeg_path is not None, ffmpeg_path)
 
 
 def check_ffprobe() -> Tuple[bool, Optional[str]]:
     """Check if ffprobe is installed and accessible.
-    
+
     Returns:
         Tuple of (is_installed, path_to_ffprobe)
     """
     ffprobe_path = shutil.which('ffprobe')
+    if ffprobe_path is None and platform.system() == 'Windows':
+        # Windows: 搜尋 WinGet Packages 目錄下的 ffprobe
+        winget_base = Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft' / 'WinGet' / 'Packages'
+        if winget_base.exists():
+            for root, dirs, files in os.walk(winget_base):
+                if 'ffprobe.exe' in files:
+                    ffprobe_path = str(Path(root) / 'ffprobe.exe')
+                    break
     return (ffprobe_path is not None, ffprobe_path)
 
 
@@ -135,18 +151,21 @@ After installation, verify with: ffmpeg -version"""
     elif system == 'windows':
         return """FFmpeg is required for audio processing but was not found.
 
-For Windows users, we recommend using WSL2 (Windows Subsystem for Linux):
+To install FFmpeg on Windows:
 
-1. Install WSL2 if not already installed
-2. Follow the Ubuntu/Debian instructions above
+1. Using WinGet (recommended):
+   winget install Gyan.FFmpeg
 
-Alternatively, for native Windows:
-1. Download FFmpeg from: https://www.ffmpeg.org/download.html
-2. Extract the archive
-3. Add the bin folder to your system PATH
-4. Restart your terminal
+2. Using Chocolatey:
+   choco install ffmpeg
 
-Note: Voice Mode works best in WSL2 on Windows."""
+3. Manual installation:
+   - Download from: https://www.ffmpeg.org/download.html
+   - Extract the archive
+   - Add the bin folder to your system PATH
+   - Restart your terminal
+
+After installation, verify with: ffmpeg -version"""
     
     else:
         return f"""FFmpeg is required for audio processing but was not found.
