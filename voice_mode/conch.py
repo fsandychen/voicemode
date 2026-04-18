@@ -132,7 +132,7 @@ class Conch:
 
         The lock is determined by the file content:
         - No file → acquire (create file)
-        - Same PID → stale from previous abort → force acquire (overwrite)
+        - Same PID → we already own it → acquire (no-op, update timestamp)
         - Different PID, process alive → locked → fail
         - Different PID, process dead → stale → force acquire
         - Lock older than CONCH_LOCK_EXPIRY → stale → force acquire
@@ -145,8 +145,10 @@ class Conch:
                 lock_pid = data.get("pid")
 
                 if lock_pid == my_pid:
-                    # Same PID — stale lock from previous abort, force acquire
-                    pass
+                    # Same PID — we already own the lock, just mark as acquired
+                    self._acquired = True
+                    self._acquire_time = datetime.now()
+                    return True
                 elif lock_pid is not None and _is_pid_alive(lock_pid):
                     # Different PID, process alive — check expiry
                     acquired_str = data.get("acquired")
@@ -166,7 +168,6 @@ class Conch:
             try:
                 self.LOCK_FILE.unlink()
             except OSError:
-                # File might be locked, try truncating and overwriting
                 pass
 
         # Write our lock data
