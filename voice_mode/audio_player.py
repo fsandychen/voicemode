@@ -40,6 +40,7 @@ class NonBlockingAudioPlayer:
         self.stream: Optional[sd.OutputStream] = None
         self.playback_complete = threading.Event()
         self.playback_error: Optional[Exception] = None
+        self._audio_duration: float = 0.0  # 音訊長度（秒），用於預設超時
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Callback function called by sounddevice for each audio buffer.
@@ -129,6 +130,9 @@ class NonBlockingAudioPlayer:
 
         # Create and start output stream
         try:
+            # 記錄音訊長度，用於 wait() 的預設超時
+            self._audio_duration = len(samples) / sample_rate
+
             self.stream = sd.OutputStream(
                 samplerate=sample_rate,
                 channels=channels,
@@ -150,14 +154,20 @@ class NonBlockingAudioPlayer:
         """Wait for playback to complete.
 
         Args:
-            timeout: Maximum time to wait in seconds (None = wait forever)
+            timeout: Maximum time to wait in seconds.
+                     None = auto: 音訊長度 + 10 秒緩衝。
+                     0 或負數 = 立即返回。
 
         Raises:
             Exception: If playback error occurred
         """
+        # 預設超時：音訊長度 + 10 秒緩衝，防止 Windows callback 不觸發時無限等待
+        if timeout is None:
+            timeout = self._audio_duration + 10.0
+
         # Wait for playback to complete
         if not self.playback_complete.wait(timeout=timeout):
-            logger.warning("Playback wait timed out")
+            logger.warning(f"Playback wait timed out after {timeout:.1f}s (audio: {self._audio_duration:.1f}s)")
 
         # Stop and close stream
         if self.stream:

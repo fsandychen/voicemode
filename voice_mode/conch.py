@@ -62,6 +62,13 @@ class Conch:
 
     LOCK_FILE = Path.home() / ".voicemode" / "conch"
 
+    # Class-level tracking of active file descriptors.
+    # When a converse call is forcefully aborted (AbortError), the instance's
+    # finally block may never run, leaving the fd open and the lock held.
+    # A new Conch instance can use _active_fds to find and force-release
+    # stale locks from the same process.
+    _active_fds: dict = {}  # {fd: Conch instance} — track all open fds
+
     def __init__(self, agent_name: Optional[str] = None):
         """Initialize Conch with optional agent name.
 
@@ -105,6 +112,11 @@ class Conch:
         Also handles stale locks: if a lock is older than CONCH_LOCK_EXPIRY
         seconds, it will be forcibly released and re-acquired.
 
+        On Windows, also detects and force-releases stale locks from the
+        same process (PID match). This handles the case where a previous
+        converse call was forcefully aborted (AbortError) and the finally
+        block never ran to release the conch.
+
         Args:
             agent_name: Name of the agent acquiring the lock
 
@@ -119,6 +131,14 @@ class Conch:
 
         # First check: is there a stale lock we can forcibly clear?
         self._check_and_clear_stale_lock()
+
+        # Windows: force-release stale locks from the SAME process.
+        # When a converse call is forcefully aborted (AbortError), the
+        # instance's finally block may never execute, leaving the fd open
+        # and the msvcrt lock held. A new try_acquire from the same PID
+        # would fail because msvcrt.locking() sees the existing lock.
+        if _IS_WINDOWS:
+            self._force_release_same_pid_stale_lock()
 
         try:
             # Open file for read/write, create if doesn't exist
@@ -145,6 +165,8 @@ class Conch:
             os.fsync(self._fd)  # Ensure data is written
 
             self._acquired = True
+            # 追蹤此 fd，讓後續同進程的 try_acquire 能找到並釋放
+            Conch._active_fds[self._fd] = self
             return True
 
         except (BlockingIOError, OSError) as e:
@@ -197,6 +219,50 @@ class Conch:
             # Can't read or parse - ignore
             pass
 
+    def _force_release_same_pid_stale_lock(self) -> None:
+        """Force-release any stale conch lock held by the same process.
+
+        When a converse call is forcefully aborted (e.g. MCP client sends
+        AbortError), the Python finally block may never execute, leaving
+        the msvcrt lock held on an orphaned file descriptor. Since
+        msvcrt.locking() prevents the same process from re-locking the
+        file, a new try_acquire would always fail.
+
+        This method finds and force-releases any such stale locks by:
+        1. Checking the lock file for our own PID
+        2. Closing and unlocking any tracked file descriptors
+        """
+        my_pid = os.getpid()
+
+        # 先釋放所有追蹤中的 stale fd
+        stale_fds = list(Conch._active_fds.keys())
+        for fd in stale_fds:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            Conch._active_fds.pop(fd, None)
+
+        # 檢查鎖定檔案是否顯示我們自己的 PID
+        if not self.LOCK_FILE.exists():
+            return
+
+        try:
+            data = json.loads(self.LOCK_FILE.read_text())
+            lock_pid = data.get("pid")
+            if lock_pid == my_pid:
+                # 同一進程的過期鎖定，強制刪除
+                try:
+                    self.LOCK_FILE.unlink()
+                except OSError:
+                    pass
+        except (json.JSONDecodeError, ValueError, OSError):
+            pass
+
     def release(self) -> float:
         """Release the lock and return seconds held.
 
@@ -221,6 +287,8 @@ class Conch:
                 os.close(self._fd)
             except OSError:
                 pass
+            # 從全域追蹤中移除
+            Conch._active_fds.pop(self._fd, None)
             self._fd = None
 
         # Only remove the lock file if we actually acquired the lock.
