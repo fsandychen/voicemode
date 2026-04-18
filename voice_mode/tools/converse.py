@@ -1863,7 +1863,8 @@ consult the MCP resources listed above.
                                 # Read and play the audio file using non-blocking player
                                 data, samplerate = sf.read(audio_path)
                                 player = NonBlockingAudioPlayer()
-                                player.play(data, samplerate, blocking=True)
+                                player.play(data, samplerate, blocking=False)
+                                await asyncio.get_event_loop().run_in_executor(None, player.wait)
                                 logger.info("Audio replay completed")
                             except Exception as e:
                                 logger.warning(f"Failed to replay cached audio: {e}. Regenerating...")

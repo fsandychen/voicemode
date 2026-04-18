@@ -425,7 +425,8 @@ async def text_to_speech(
                         # Use non-blocking audio player for concurrent playback support
                         player = NonBlockingAudioPlayer()
                         player.play(samples_with_buffer, audio.frame_rate, blocking=False)
-                        player.wait()
+                        # 在線程池中等待播放完成，避免阻塞 asyncio 事件循環
+                        await asyncio.get_event_loop().run_in_executor(None, player.wait)
                         
                         playback_end = time.perf_counter()
                         metrics['playback'] = playback_end - playback_start
@@ -654,7 +655,8 @@ async def play_chime_start(
         chime_float = chime.astype(np.float32) / 32768.0
         # Use non-blocking audio player to avoid interference with concurrent playback
         player = NonBlockingAudioPlayer()
-        player.play(chime_float, sample_rate, blocking=True)
+        player.play(chime_float, sample_rate, blocking=False)
+        await asyncio.get_event_loop().run_in_executor(None, player.wait)
         return True
     except Exception as e:
         logger.debug(f"Could not play start chime: {e}")
@@ -688,7 +690,8 @@ async def play_chime_end(
         chime_float = chime.astype(np.float32) / 32768.0
         # Use non-blocking audio player to avoid interference with concurrent playback
         player = NonBlockingAudioPlayer()
-        player.play(chime_float, sample_rate, blocking=True)
+        player.play(chime_float, sample_rate, blocking=False)
+        await asyncio.get_event_loop().run_in_executor(None, player.wait)
         return True
     except Exception as e:
         logger.debug(f"Could not play end chime: {e}")
@@ -735,7 +738,8 @@ async def play_system_audio(message_key: str, fallback_text: Optional[str] = Non
 
             # Use non-blocking audio player to avoid interference with concurrent playback
             player = NonBlockingAudioPlayer()
-            player.play(samples, audio.frame_rate, blocking=True)
+            player.play(samples, audio.frame_rate, blocking=False)
+            await asyncio.get_event_loop().run_in_executor(None, player.wait)
 
             logger.info(f"✓ System audio played successfully: {message_key}")
             return True
