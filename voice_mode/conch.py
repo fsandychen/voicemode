@@ -31,10 +31,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Windows 相容性：msvcrt 替代 fcntl
+# Windows 相容性
 _IS_WINDOWS = sys.platform == 'win32'
 if _IS_WINDOWS:
-    import msvcrt
     import ctypes
 else:
     import fcntl
@@ -49,6 +48,25 @@ def _get_lock_expiry() -> float:
         return 120.0  # Default 2 minutes
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is alive."""
+    if _IS_WINDOWS:
+        try:
+            handle = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+
 class Conch:
     """Simple lock file for voice conversation coordination.
 
@@ -58,49 +76,29 @@ class Conch:
     - agent: Name of the agent holding the lock
     - acquired: ISO timestamp when lock was acquired
     - expires: Optional expiry time (reserved for future use)
+
+    On Windows, uses PID-based locking instead of msvcrt.locking() to
+    avoid issues with orphaned file locks when MCP calls are aborted.
     """
 
     LOCK_FILE = Path.home() / ".voicemode" / "conch"
 
-    # Class-level tracking of active file descriptors.
-    # When a converse call is forcefully aborted (AbortError), the instance's
-    # finally block may never run, leaving the fd open and the lock held.
-    # A new Conch instance can use _active_fds to find and force-release
-    # stale locks from the same process.
-    _active_fds: dict = {}  # {fd: Conch instance} — track all open fds
-
     def __init__(self, agent_name: Optional[str] = None):
-        """Initialize Conch with optional agent name.
-
-        Args:
-            agent_name: Name of the agent (e.g., "cora"). Used for debugging/logging.
-        """
         self.agent_name = agent_name
         self._acquired = False
-        self._fd = None  # File descriptor for flock
-        self._acquire_time = None  # Track when acquired
+        self._fd = None  # File descriptor for flock (Unix only)
+        self._acquire_time = None
 
     def acquire(self, agent_name: Optional[str] = None) -> bool:
-        """Create the lock file.
-
-        Args:
-            agent_name: Override the agent name set in __init__
-
-        Returns:
-            True if lock was acquired successfully
-        """
+        """Create the lock file (non-atomic, for simple use cases)."""
         agent = agent_name or self.agent_name or "unknown"
-
-        # Ensure parent directory exists
         self.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-
         data = {
             "pid": os.getpid(),
             "agent": agent,
             "acquired": datetime.now().isoformat(),
             "expires": None
         }
-
         self.LOCK_FILE.write_text(json.dumps(data, indent=2))
         self._acquired = True
         return True
@@ -108,49 +106,90 @@ class Conch:
     def try_acquire(self, agent_name: Optional[str] = None) -> bool:
         """Atomically try to acquire the conch.
 
-        Uses fcntl.flock() for true atomic locking across processes.
-        Also handles stale locks: if a lock is older than CONCH_LOCK_EXPIRY
-        seconds, it will be forcibly released and re-acquired.
+        On Windows: PID-based locking. Checks if the lock file's PID is
+        alive. If dead or same-PID (stale from previous abort), overwrites.
+        No msvcrt.locking() — avoids orphaned file lock issues.
 
-        On Windows, also detects and force-releases stale locks from the
-        same process (PID match). This handles the case where a previous
-        converse call was forcefully aborted (AbortError) and the finally
-        block never ran to release the conch.
-
-        Args:
-            agent_name: Name of the agent acquiring the lock
+        On Unix: Uses fcntl.flock() for true atomic locking.
 
         Returns:
             True if lock acquired, False if already held by another process
         """
         if self._acquired:
-            return True  # Already holding it
+            return True
 
         agent = agent_name or self.agent_name or "unknown"
+        my_pid = os.getpid()
         self.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        # First check: is there a stale lock we can forcibly clear?
-        self._check_and_clear_stale_lock()
-
-        # Windows: force-release stale locks from the SAME process.
-        # When a converse call is forcefully aborted (AbortError), the
-        # instance's finally block may never execute, leaving the fd open
-        # and the msvcrt lock held. A new try_acquire from the same PID
-        # would fail because msvcrt.locking() sees the existing lock.
         if _IS_WINDOWS:
-            self._force_release_same_pid_stale_lock()
+            return self._try_acquire_windows(agent, my_pid)
+        else:
+            return self._try_acquire_unix(agent)
 
+    def _try_acquire_windows(self, agent: str, my_pid: int) -> bool:
+        """Windows: PID-based lock acquisition.
+
+        The lock is determined by the file content:
+        - No file → acquire (create file)
+        - Same PID → stale from previous abort → force acquire (overwrite)
+        - Different PID, process alive → locked → fail
+        - Different PID, process dead → stale → force acquire
+        - Lock older than CONCH_LOCK_EXPIRY → stale → force acquire
+        """
+        lock_expiry = _get_lock_expiry()
+
+        if self.LOCK_FILE.exists():
+            try:
+                data = json.loads(self.LOCK_FILE.read_text())
+                lock_pid = data.get("pid")
+
+                if lock_pid == my_pid:
+                    # Same PID — stale lock from previous abort, force acquire
+                    pass
+                elif lock_pid is not None and _is_pid_alive(lock_pid):
+                    # Different PID, process alive — check expiry
+                    acquired_str = data.get("acquired")
+                    if acquired_str and lock_expiry > 0:
+                        age = (datetime.now() - datetime.fromisoformat(acquired_str)).total_seconds()
+                        if age > lock_expiry:
+                            pass  # Expired, force acquire
+                        else:
+                            return False  # Active lock held by another process
+                    else:
+                        return False  # Active lock, no expiry check
+                # else: PID dead or invalid → stale → force acquire
+            except (json.JSONDecodeError, ValueError, OSError):
+                pass  # Corrupt file → force acquire
+
+            # Force acquire: remove stale file
+            try:
+                self.LOCK_FILE.unlink()
+            except OSError:
+                # File might be locked, try truncating and overwriting
+                pass
+
+        # Write our lock data
         try:
-            # Open file for read/write, create if doesn't exist
+            self._acquire_time = datetime.now()
+            data = {
+                "pid": my_pid,
+                "agent": agent,
+                "acquired": self._acquire_time.isoformat(),
+                "expires": None
+            }
+            self.LOCK_FILE.write_text(json.dumps(data, indent=2))
+            self._acquired = True
+            return True
+        except OSError:
+            return False
+
+    def _try_acquire_unix(self, agent: str) -> bool:
+        """Unix: fcntl.flock()-based lock acquisition."""
+        self._check_and_clear_stale_lock()
+        try:
             self._fd = os.open(str(self.LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
-
-            # Try to get exclusive lock (non-blocking)
-            if _IS_WINDOWS:
-                msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
-            else:
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-            # Got lock - write our info
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._acquire_time = datetime.now()
             data = {
                 "pid": os.getpid(),
@@ -158,19 +197,13 @@ class Conch:
                 "acquired": self._acquire_time.isoformat(),
                 "expires": None
             }
-
             os.ftruncate(self._fd, 0)
             os.lseek(self._fd, 0, os.SEEK_SET)
             os.write(self._fd, json.dumps(data, indent=2).encode())
-            os.fsync(self._fd)  # Ensure data is written
-
+            os.fsync(self._fd)
             self._acquired = True
-            # 追蹤此 fd，讓後續同進程的 try_acquire 能找到並釋放
-            Conch._active_fds[self._fd] = self
             return True
-
-        except (BlockingIOError, OSError) as e:
-            # Lock held by another process, or other OS error
+        except (BlockingIOError, OSError):
             if self._fd is not None:
                 try:
                     os.close(self._fd)
@@ -180,82 +213,20 @@ class Conch:
             return False
 
     def _check_and_clear_stale_lock(self) -> None:
-        """Check for and clear stale locks based on timestamp.
-
-        If a lock file exists and its timestamp exceeds CONCH_LOCK_EXPIRY,
-        forcibly remove it to allow new acquisitions. This handles the case
-        where a process is alive but stuck and won't release the lock.
-
-        Note: This deletes the file, creating a new inode. The stuck process
-        still holds its flock on the old inode, but we can now create a fresh
-        lock file.
-        """
+        """Unix only: Clear stale locks based on timestamp."""
         lock_expiry = _get_lock_expiry()
         if lock_expiry <= 0:
-            return  # Stale lock detection disabled
-
+            return
         if not self.LOCK_FILE.exists():
             return
-
         try:
             data = json.loads(self.LOCK_FILE.read_text())
             acquired_str = data.get("acquired")
             if not acquired_str:
                 return
-
             acquired_time = datetime.fromisoformat(acquired_str)
             age_seconds = (datetime.now() - acquired_time).total_seconds()
-
             if age_seconds > lock_expiry:
-                # Lock is stale - forcibly remove it
-                stale_agent = data.get("agent", "unknown")
-                stale_pid = data.get("pid", "unknown")
-                try:
-                    self.LOCK_FILE.unlink()
-                    # Log would be nice here, but avoid import complexity
-                except OSError:
-                    pass
-        except (json.JSONDecodeError, ValueError, OSError):
-            # Can't read or parse - ignore
-            pass
-
-    def _force_release_same_pid_stale_lock(self) -> None:
-        """Force-release any stale conch lock held by the same process.
-
-        When a converse call is forcefully aborted (e.g. MCP client sends
-        AbortError), the Python finally block may never execute, leaving
-        the msvcrt lock held on an orphaned file descriptor. Since
-        msvcrt.locking() prevents the same process from re-locking the
-        file, a new try_acquire would always fail.
-
-        This method finds and force-releases any such stale locks by:
-        1. Checking the lock file for our own PID
-        2. Closing and unlocking any tracked file descriptors
-        """
-        my_pid = os.getpid()
-
-        # 先釋放所有追蹤中的 stale fd
-        stale_fds = list(Conch._active_fds.keys())
-        for fd in stale_fds:
-            try:
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            Conch._active_fds.pop(fd, None)
-
-        # 檢查鎖定檔案是否顯示我們自己的 PID
-        if not self.LOCK_FILE.exists():
-            return
-
-        try:
-            data = json.loads(self.LOCK_FILE.read_text())
-            lock_pid = data.get("pid")
-            if lock_pid == my_pid:
-                # 同一進程的過期鎖定，強制刪除
                 try:
                     self.LOCK_FILE.unlink()
                 except OSError:
@@ -264,35 +235,20 @@ class Conch:
             pass
 
     def release(self) -> float:
-        """Release the lock and return seconds held.
-
-        Only removes the lock file if this instance actually acquired the lock.
-        Removing it when not acquired would destroy the lock held by another
-        process (they'd be flocking different inodes after re-creation).
-
-        Returns:
-            Seconds the lock was held, or 0.0 if not acquired
-        """
+        """Release the lock and return seconds held."""
         held_seconds = 0.0
-
         if self._acquire_time:
             held_seconds = (datetime.now() - self._acquire_time).total_seconds()
 
         if self._fd is not None:
             try:
-                if _IS_WINDOWS:
-                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
-                else:
+                if not _IS_WINDOWS:
                     fcntl.flock(self._fd, fcntl.LOCK_UN)
                 os.close(self._fd)
             except OSError:
                 pass
-            # 從全域追蹤中移除
-            Conch._active_fds.pop(self._fd, None)
             self._fd = None
 
-        # Only remove the lock file if we actually acquired the lock.
-        # If we didn't acquire it, the file belongs to another process.
         if self._acquired and self.LOCK_FILE.exists():
             try:
                 self.LOCK_FILE.unlink()
@@ -301,78 +257,45 @@ class Conch:
 
         self._acquired = False
         self._acquire_time = None
-
         return held_seconds
 
     @classmethod
     def is_active(cls) -> bool:
-        """Check if a voice conversation is currently active.
-
-        A conversation is considered active if:
-        1. The lock file exists
-        2. The PID in the file corresponds to a running process
-        3. The lock is not stale (acquired within CONCH_LOCK_EXPIRY seconds)
-
-        Returns:
-            True if converse is active, False otherwise
-        """
+        """Check if a voice conversation is currently active."""
         if not cls.LOCK_FILE.exists():
             return False
-
         try:
             data = json.loads(cls.LOCK_FILE.read_text())
             pid = data.get("pid")
-
             if pid is None:
                 return False
-
-            # Check if process is alive
-            if _IS_WINDOWS:
-                # Windows: 使用 OpenProcess 檢查進程是否存在
-                handle = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)
-                if not handle:
-                    return False
-                ctypes.windll.kernel32.CloseHandle(handle)
-            else:
-                os.kill(pid, 0)
-
-            # Check if lock is stale based on timestamp
+            if not _is_pid_alive(pid):
+                return False
             lock_expiry = _get_lock_expiry()
             if lock_expiry > 0:
                 acquired_str = data.get("acquired")
                 if acquired_str:
-                    acquired_time = datetime.fromisoformat(acquired_str)
-                    age_seconds = (datetime.now() - acquired_time).total_seconds()
-                    if age_seconds > lock_expiry:
-                        # Lock is stale - consider it inactive
+                    age = (datetime.now() - datetime.fromisoformat(acquired_str)).total_seconds()
+                    if age > lock_expiry:
                         return False
-
             return True
         except (json.JSONDecodeError, ProcessLookupError, PermissionError, OSError, ValueError):
-            # JSON invalid, process dead, no permission to signal, or invalid timestamp
             return False
 
     @classmethod
     def get_holder(cls) -> Optional[dict]:
-        """Get information about the current lock holder.
-
-        Returns:
-            Dict with lock info if active, None otherwise
-        """
+        """Get information about the current lock holder."""
         if not cls.is_active():
             return None
-
         try:
             return json.loads(cls.LOCK_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             return None
 
     def __enter__(self):
-        """Context manager entry - acquire the lock."""
         self.acquire()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - release the lock."""
         self.release()
-        return False  # Don't suppress exceptions
+        return False
