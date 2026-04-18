@@ -393,7 +393,7 @@ TTS \\bAPI\\b A P I # API as individual letters
     # Load configuration from all files in order (global first, project-specific last)
     for config_path in config_files:
         if config_path.exists():
-            with open(config_path, 'r') as f:
+            with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
                 i = 0
                 while i < len(lines):

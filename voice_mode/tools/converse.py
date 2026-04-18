@@ -13,6 +13,7 @@ from datetime import datetime
 import numpy as np
 import sounddevice as sd
 from scipy.io.wavfile import write
+from scipy import signal as _scipy_signal
 from pydub import AudioSegment
 from openai import AsyncOpenAI
 import httpx
@@ -941,7 +942,7 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             - audio_data: Numpy array of recorded audio samples
             - speech_detected: Boolean indicating if speech was detected during recording
     """
-    
+
     logger.info(f"record_audio_with_silence_detection called - VAD_AVAILABLE={VAD_AVAILABLE}, DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}, min_duration={min_duration}")
 
     if not VAD_AVAILABLE:
@@ -1034,59 +1035,109 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             if _IS_WINDOWS:
                 # Windows: sd.InputStream callback 在 MCP 進程中不會觸發
                 # 改用 sd.rec() + sd.wait() 分段輪詢錄音
-                logger.info("Windows: using polling-based VAD recording (sd.rec + sd.wait)")
+                # 最佳化：每次錄較大的 chunk（200ms），再切成 VAD 子 chunk（30ms）
+                # 避免每 30ms 都做 sd.rec()+sd.wait()，因為 PortAudio 開關 stream 開銷 ~94ms
+                REC_CHUNK_MS = 200  # 每次錄音的長度
+                rec_chunk_samples = int(SAMPLE_RATE * REC_CHUNK_MS / 1000)
+                rec_chunk_duration_s = REC_CHUNK_MS / 1000
+                vad_sub_chunks_per_rec = REC_CHUNK_MS // VAD_CHUNK_DURATION_MS  # 200/30 ≈ 6
+
+                logger.info(f"Windows: using optimized polling (rec={REC_CHUNK_MS}ms, vad={VAD_CHUNK_DURATION_MS}ms)")
+
+                # DEBUG: 測試 sd.rec() 是否可用
+                import sys as _sys
+                _dbg_path = os.path.join(os.path.expanduser('~'), 'voicemode_rec_debug.log')
+                try:
+                    test_rec = sd.rec(480, samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=np.int16)
+                    _sd_wait_with_timeout(2.0)
+                    test_max = np.max(np.abs(test_rec)) if test_rec is not None else -1
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(f"[{time.strftime('%H:%M:%S')}] sd.rec test OK, max_amp={test_max}, device={sd.default.device}, pid={os.getpid()}\n")
+                except Exception as dbg_e:
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(f"[{time.strftime('%H:%M:%S')}] sd.rec FAILED: {dbg_e}, pid={os.getpid()}\n")
+                    import traceback
+                    with open(_dbg_path, 'a') as _df:
+                        traceback.print_exc(file=_df)
 
                 while recording_duration < max_duration and not stop_recording:
-                    # 每段錄一個 chunk 的長度
-                    chunk_num_samples = int(chunk_samples)
+                    # 錄一個較大的 chunk
+                    rec_samples = min(rec_chunk_samples, int((max_duration - recording_duration) * SAMPLE_RATE))
+                    if rec_samples <= 0:
+                        break
+                    _loop_dbg = f"[{time.strftime('%H:%M:%S')}] loop: dur={recording_duration:.1f}s, samples={rec_samples}"
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(_loop_dbg + " calling sd.rec...\n")
                     chunk_recording = sd.rec(
-                        chunk_num_samples,
+                        rec_samples,
                         samplerate=SAMPLE_RATE,
                         channels=CHANNELS,
                         dtype=np.int16
                     )
-                    wait_ok = _sd_wait_with_timeout(2.0)
+                    wait_ok = _sd_wait_with_timeout(rec_chunk_duration_s + 2.0)
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(f"[{time.strftime('%H:%M:%S')}] sd.wait done, ok={wait_ok}, max_amp={np.max(np.abs(chunk_recording)) if chunk_recording is not None else 'None'}\n")
+
+                    chunk_flat = chunk_recording.flatten()
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(f"[{time.strftime('%H:%M:%S')}] chunk recorded, len={len(chunk_flat)}\n")
+
+                    # 將大 chunk 切成 VAD 子 chunk 進行語音偵測
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(f"[{time.strftime('%H:%M:%S')}] VAD sub-loop start\n")
                     if not wait_ok:
                         logger.warning("Chunk recording timed out, stopping early")
                         break
 
-                    chunk_flat = chunk_recording.flatten()
                     chunks.append(chunk_flat)
 
-                    # 降取樣 24kHz → 16kHz 給 VAD
-                    from scipy import signal
-                    resampled_length = int(len(chunk_flat) * vad_sample_rate / SAMPLE_RATE)
-                    vad_chunk = signal.resample(chunk_flat, resampled_length)
-                    vad_chunk = vad_chunk[:vad_chunk_samples].astype(np.int16)
-                    chunk_bytes = vad_chunk.tobytes()
+                    # 將大 chunk 切成 VAD 子 chunk 進行語音偵測
+                    samples_per_vad_sub = int(SAMPLE_RATE * VAD_CHUNK_DURATION_MS / 1000)
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(f"[{time.strftime('%H:%M:%S')}] entering VAD sub-loop, {vad_sub_chunks_per_rec} subs\n")
+                    for sub_idx in range(vad_sub_chunks_per_rec):
+                        sub_start = sub_idx * samples_per_vad_sub
+                        sub_end = sub_start + samples_per_vad_sub
+                        if sub_end > len(chunk_flat):
+                            break
+                        sub_chunk = chunk_flat[sub_start:sub_end]
 
-                    # VAD 判斷
-                    try:
-                        is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
-                    except Exception as vad_e:
-                        logger.warning(f"VAD error: {vad_e}, treating as speech")
-                        is_speech = True
+                        # 降取樣 24kHz → 16kHz 給 VAD
+                        resampled_length = int(len(sub_chunk) * vad_sample_rate / SAMPLE_RATE)
+                        vad_chunk = _scipy_signal.resample(sub_chunk.astype(np.float64), resampled_length)
+                        # NOTE: _scipy_signal 是在 converse() 主線程中預先載入的
+                        vad_chunk = vad_chunk[:vad_chunk_samples].astype(np.int16)
+                        chunk_bytes = vad_chunk.tobytes()
 
-                    # 狀態機：等待語音 → 偵測語音 → 累積靜音 → 超過閾值停止
-                    if not speech_detected:
-                        if is_speech:
-                            logger.info("🎤 Speech detected, starting active recording")
-                            speech_detected = True
-                            silence_duration_ms = 0
-                    else:
-                        if is_speech:
-                            silence_duration_ms = 0
+                        # VAD 判斷
+                        try:
+                            is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
+                        except Exception as vad_e:
+                            is_speech = True
+
+                        # 狀態機
+                        if not speech_detected:
+                            if is_speech:
+                                logger.info("🎤 Speech detected, starting active recording")
+                                speech_detected = True
+                                silence_duration_ms = 0
                         else:
-                            silence_duration_ms += VAD_CHUNK_DURATION_MS
-                            if silence_duration_ms % 200 == 0:
-                                logger.debug(f"Silence: {silence_duration_ms}ms")
+                            if is_speech:
+                                silence_duration_ms = 0
+                            else:
+                                silence_duration_ms += VAD_CHUNK_DURATION_MS
+                                if silence_duration_ms % 200 == 0:
+                                    logger.debug(f"Silence: {silence_duration_ms}ms")
 
-                            effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
-                            if recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
-                                logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
-                                stop_recording = True
+                                effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
+                                if (recording_duration + sub_idx * VAD_CHUNK_DURATION_MS / 1000) >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                    logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
+                                    stop_recording = True
+                                    break
 
-                    recording_duration += chunk_duration_s
+                    recording_duration += rec_chunk_duration_s
+                    with open(_dbg_path, 'a') as _df:
+                        _df.write(f"[{time.strftime('%H:%M:%S')}] loop end: dur={recording_duration:.1f}s, speech={speech_detected}, stop={stop_recording}\n")
 
                 # Windows 輪詢結束，組合結果並提前返回
                 if chunks:
@@ -1127,10 +1178,9 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         
                         # For VAD, we need to downsample from 24kHz to 16kHz
                         # Use scipy's resample for proper downsampling
-                        from scipy import signal
                         # Calculate the number of samples we need after resampling
                         resampled_length = int(len(chunk_flat) * vad_sample_rate / SAMPLE_RATE)
-                        vad_chunk = signal.resample(chunk_flat, resampled_length)
+                        vad_chunk = _scipy_signal.resample(chunk_flat, resampled_length)
                         # Take exactly the number of samples VAD expects
                         vad_chunk = vad_chunk[:vad_chunk_samples].astype(np.int16)
                         chunk_bytes = vad_chunk.tobytes()
@@ -1722,6 +1772,7 @@ consult the MCP resources listed above.
                     event_logger.log_event(event_logger.RECORDING_START)
 
                 record_start = time.perf_counter()
+                # scipy.signal 已在 module level 載入，避免在 executor thread 中載入導致死鎖
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}")
                 _record_timeout = listen_duration_max + 15.0
                 try:
